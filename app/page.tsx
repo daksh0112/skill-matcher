@@ -1,4 +1,5 @@
 import Link from "next/link";
+import NavAuth from "./NavAuth";
 
 const features = [
   {
@@ -57,12 +58,7 @@ export default function Home() {
             SkillMatch <span style={{ color: "#a78bfa" }}>AI</span>
           </span>
         </div>
-        <Link
-          href="/assess"
-          className="btn-primary text-white text-sm font-medium px-5 py-2.5 rounded-full"
-        >
-          Start Free →
-        </Link>
+        <NavAuth />
       </nav>
 
       {/* Hero */}

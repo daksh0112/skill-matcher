@@ -1,5 +1,8 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { NextRequest, NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -17,6 +20,22 @@ const RISK_LABELS: Record<string, string> = {
 };
 
 export async function POST(req: NextRequest) {
+  // Auth check
+  const session = await getServerSession(authOptions);
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "UNAUTHENTICATED" }, { status: 401 });
+  }
+
+  // Usage check
+  const user = await prisma.user.findUnique({ where: { id: session.user.id } });
+  if (!user) {
+    return NextResponse.json({ error: "User not found" }, { status: 404 });
+  }
+
+  if (user.freeUsed && !user.isPaid) {
+    return NextResponse.json({ error: "PAYWALL" }, { status: 402 });
+  }
+
   const { skills, interests, timeAvailable, riskTolerance, background } =
     await req.json();
 
@@ -45,7 +64,7 @@ Respond ONLY with valid JSON in this exact format:
       "incomeRange": "Realistic monthly range e.g. '$500–$3,000'",
       "timeToFirstIncome": "e.g. '2–4 weeks' or '2–3 months'",
       "difficulty": "Easy / Medium / Hard",
-      "difficultyLevel": 1-5 number (1=easiest, 5=hardest),
+      "difficultyLevel": 1,
       "firstSteps": [
         "Specific, concrete action step 1",
         "Specific, concrete action step 2",
@@ -57,10 +76,11 @@ Respond ONLY with valid JSON in this exact format:
 }
 
 Rules:
-- Be specific to their profile. If they know Python + Finance, suggest a fintech tool or financial data consulting, not "start a blog".
+- Be specific to their profile. Reference their actual skills.
 - Income ranges must be realistic, not aspirational fantasy numbers.
-- First steps must be actionable THIS WEEK, not vague ("research the market" is too vague — "post 3 Reels this week showing your Excel tips" is good).
+- First steps must be actionable THIS WEEK.
 - Sort paths from most accessible/quick to highest upside/complexity.
+- difficultyLevel is a number 1-5 (1=easiest).
 - Respond with JSON only, no markdown, no extra text.`;
 
   try {
@@ -70,12 +90,24 @@ Rules:
       messages: [{ role: "user", content: prompt }],
     });
 
-    const raw = message.content[0].type === "text" ? message.content[0].text : "";
+    const raw =
+      message.content[0].type === "text" ? message.content[0].text : "";
     const parsed = JSON.parse(raw);
+
+    // Mark free usage after successful analysis
+    if (!user.freeUsed) {
+      await prisma.user.update({
+        where: { id: session.user.id },
+        data: { freeUsed: true },
+      });
+    }
 
     return NextResponse.json(parsed);
   } catch (err) {
     console.error("API error:", err);
-    return NextResponse.json({ error: "Failed to generate results" }, { status: 500 });
+    return NextResponse.json(
+      { error: "Failed to generate results" },
+      { status: 500 }
+    );
   }
 }

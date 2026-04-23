@@ -1,7 +1,30 @@
 "use client";
 
-import { useState, KeyboardEvent } from "react";
+import { useState, KeyboardEvent, useEffect } from "react";
+import { useSession, signIn } from "next-auth/react";
 import Link from "next/link";
+
+declare global {
+  interface Window {
+    Razorpay: new (options: RazorpayOptions) => { open: () => void };
+  }
+}
+
+type RazorpayOptions = {
+  key: string;
+  amount: number;
+  currency: string;
+  name: string;
+  description: string;
+  order_id: string;
+  handler: (response: {
+    razorpay_order_id: string;
+    razorpay_payment_id: string;
+    razorpay_signature: string;
+  }) => void;
+  prefill: { email?: string | null; name?: string | null };
+  theme: { color: string };
+};
 
 const INTEREST_OPTIONS = [
   "Teaching & Education", "Writing & Content", "Design & Art",
@@ -20,9 +43,9 @@ const TIME_OPTIONS = [
 ];
 
 const RISK_OPTIONS = [
-  { value: "low", label: "Low — I need stable income", sub: "Prefer guaranteed returns before quitting anything" },
-  { value: "medium", label: "Medium — some risk is fine", sub: "Willing to invest time/money for upside" },
-  { value: "high", label: "High — I'm all in", sub: "Ready to bet big for a big outcome" },
+  { value: "low", label: "Low — I need stable income", sub: "Prefer guaranteed returns" },
+  { value: "medium", label: "Medium — some risk is fine", sub: "Willing to invest for upside" },
+  { value: "high", label: "High — I'm all in", sub: "Ready to bet big" },
 ];
 
 type FormData = {
@@ -33,8 +56,6 @@ type FormData = {
   background: string;
 };
 
-type IncomeStep = string;
-
 type IncomePath = {
   title: string;
   tagline: string;
@@ -43,30 +64,34 @@ type IncomePath = {
   timeToFirstIncome: string;
   difficulty: string;
   difficultyLevel: number;
-  firstSteps: IncomeStep[];
+  firstSteps: string[];
   tags: string[];
 };
 
-type ApiResult = {
-  paths: IncomePath[];
-  summary: string;
-};
+type ApiResult = { paths: IncomePath[]; summary: string };
 
 const STEPS = ["Skills", "Interests", "Time", "Risk", "Background"];
 
 export default function AssessPage() {
+  const { data: session, status } = useSession();
   const [step, setStep] = useState(0);
   const [skillInput, setSkillInput] = useState("");
   const [form, setForm] = useState<FormData>({
-    skills: [],
-    interests: [],
-    timeAvailable: "",
-    riskTolerance: "",
-    background: "",
+    skills: [], interests: [], timeAvailable: "", riskTolerance: "", background: "",
   });
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ApiResult | null>(null);
-  const [error, setError] = useState("");
+  const [uiState, setUiState] = useState<"form" | "paywall" | "paying">("form");
+  const [payError, setPayError] = useState("");
+
+  // Load Razorpay script
+  useEffect(() => {
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.async = true;
+    document.body.appendChild(script);
+    return () => { document.body.removeChild(script); };
+  }, []);
 
   const addSkill = (raw: string) => {
     const trimmed = raw.trim();
@@ -98,22 +123,87 @@ export default function AssessPage() {
     return true;
   };
 
-  const handleSubmit = async () => {
+  const runAnalysis = async () => {
     setLoading(true);
-    setError("");
+    setPayError("");
     try {
       const res = await fetch("/api/match", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(form),
       });
+
+      if (res.status === 401) {
+        signIn("google", { callbackUrl: "/assess" });
+        return;
+      }
+
+      if (res.status === 402) {
+        setUiState("paywall");
+        setLoading(false);
+        return;
+      }
+
       if (!res.ok) throw new Error("Request failed");
+
       const data = await res.json();
       setResult(data);
     } catch {
-      setError("Something went wrong. Please try again.");
+      setPayError("Something went wrong. Please try again.");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (status === "unauthenticated") {
+      signIn("google", { callbackUrl: "/assess" });
+      return;
+    }
+    await runAnalysis();
+  };
+
+  const handlePayment = async () => {
+    setUiState("paying");
+    setPayError("");
+
+    try {
+      const orderRes = await fetch("/api/payment/create-order", { method: "POST" });
+      if (!orderRes.ok) throw new Error("Could not create order");
+      const { orderId, amount } = await orderRes.json();
+
+      const options: RazorpayOptions = {
+        key: process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID!,
+        amount,
+        currency: "INR",
+        name: "SkillMatch AI",
+        description: "Unlimited analyses — lifetime access",
+        order_id: orderId,
+        prefill: { email: session?.user?.email, name: session?.user?.name },
+        theme: { color: "#7c3aed" },
+        handler: async (response) => {
+          const verifyRes = await fetch("/api/payment/verify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(response),
+          });
+
+          if (verifyRes.ok) {
+            setUiState("form");
+            await runAnalysis();
+          } else {
+            setPayError("Payment verification failed. Contact support.");
+            setUiState("paywall");
+          }
+        },
+      };
+
+      const rzp = new window.Razorpay(options);
+      rzp.open();
+      setUiState("paywall"); // reset while modal is open
+    } catch {
+      setPayError("Could not initiate payment. Try again.");
+      setUiState("paywall");
     }
   };
 
@@ -123,25 +213,25 @@ export default function AssessPage() {
     return "#f87171";
   };
 
+  const resetAll = () => {
+    setResult(null);
+    setStep(0);
+    setUiState("form");
+    setForm({ skills: [], interests: [], timeAvailable: "", riskTolerance: "", background: "" });
+  };
+
+  // Loading analysis
   if (loading) {
     return (
-      <div
-        className="min-h-screen flex flex-col items-center justify-center px-6"
-        style={{ background: "#0a0a0f" }}
-      >
+      <div className="min-h-screen flex flex-col items-center justify-center px-6" style={{ background: "#0a0a0f" }}>
         <div
           className="w-16 h-16 rounded-full border-2 border-transparent spin-slow mb-8"
-          style={{
-            borderTopColor: "#7c3aed",
-            borderRightColor: "#4f46e5",
-          }}
+          style={{ borderTopColor: "#7c3aed", borderRightColor: "#4f46e5" }}
         />
-        <h2 className="text-2xl font-semibold mb-3" style={{ color: "#f0f0ff" }}>
+        <h2 className="text-2xl font-semibold mb-2" style={{ color: "#f0f0ff" }}>
           Analyzing your profile...
         </h2>
-        <p style={{ color: "rgba(240,240,255,0.45)" }}>
-          Mapping your skills to income paths
-        </p>
+        <p style={{ color: "rgba(240,240,255,0.4)" }}>Mapping your skills to income paths</p>
         <div className="mt-8 flex flex-col gap-3 w-full max-w-md">
           {[80, 65, 90].map((w, i) => (
             <div key={i} className="skeleton h-4" style={{ width: `${w}%` }} />
@@ -151,26 +241,87 @@ export default function AssessPage() {
     );
   }
 
+  // Paywall screen
+  if (uiState === "paywall") {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-6" style={{ background: "#0a0a0f" }}>
+        <div
+          className="w-full max-w-md rounded-3xl p-10 text-center fade-in-up"
+          style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)" }}
+        >
+          <div className="text-5xl mb-6">🔓</div>
+          <h2 className="text-2xl font-bold mb-2" style={{ color: "#f0f0ff" }}>
+            You&apos;ve used your free analysis
+          </h2>
+          <p className="text-sm mb-8" style={{ color: "rgba(240,240,255,0.5)" }}>
+            Get unlimited analyses — try different skill sets, explore more paths,
+            discover new income opportunities anytime.
+          </p>
+
+          {/* Pricing card */}
+          <div
+            className="rounded-2xl p-6 mb-6"
+            style={{
+              background: "linear-gradient(135deg, rgba(124,58,237,0.15), rgba(79,70,229,0.1))",
+              border: "1px solid rgba(124,58,237,0.3)",
+            }}
+          >
+            <div className="text-4xl font-bold mb-1" style={{ color: "#f0f0ff" }}>₹199</div>
+            <div className="text-sm mb-4" style={{ color: "#a78bfa" }}>One-time · Lifetime access</div>
+            <ul className="text-sm text-left space-y-2" style={{ color: "rgba(240,240,255,0.65)" }}>
+              {[
+                "Unlimited skill analyses",
+                "Try different profiles & scenarios",
+                "Always updated with new paths",
+                "Priority support",
+              ].map((f) => (
+                <li key={f} className="flex items-center gap-2">
+                  <span style={{ color: "#34d399" }}>✓</span> {f}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {payError && (
+            <div
+              className="mb-4 p-3 rounded-xl text-sm"
+              style={{ background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.2)", color: "#fca5a5" }}
+            >
+              {payError}
+            </div>
+          )}
+
+          <button
+            onClick={handlePayment}
+            className="btn-primary w-full text-white font-semibold py-4 rounded-xl mb-3"
+          >
+            Unlock unlimited — ₹199
+          </button>
+
+          <button
+            onClick={resetAll}
+            className="w-full text-sm py-3"
+            style={{ color: "rgba(240,240,255,0.35)" }}
+          >
+            ← Start over
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Results screen
   if (result) {
     return (
       <div className="min-h-screen px-6 py-12" style={{ background: "#0a0a0f" }}>
         <div className="max-w-4xl mx-auto">
-          {/* Header */}
           <div className="text-center mb-12 fade-in-up">
-            <Link
-              href="/"
-              className="inline-flex items-center gap-2 text-sm mb-8"
-              style={{ color: "rgba(240,240,255,0.4)" }}
-            >
+            <Link href="/" className="inline-flex items-center gap-2 text-sm mb-8" style={{ color: "rgba(240,240,255,0.4)" }}>
               ← SkillMatch AI
             </Link>
             <div
               className="inline-block px-4 py-1.5 rounded-full text-sm mb-6"
-              style={{
-                background: "rgba(52, 211, 153, 0.1)",
-                border: "1px solid rgba(52, 211, 153, 0.25)",
-                color: "#34d399",
-              }}
+              style={{ background: "rgba(52,211,153,0.1)", border: "1px solid rgba(52,211,153,0.25)", color: "#34d399" }}
             >
               ✓ Analysis complete — {result.paths.length} paths found
             </div>
@@ -182,7 +333,6 @@ export default function AssessPage() {
             </p>
           </div>
 
-          {/* Paths */}
           <div className="flex flex-col gap-6">
             {result.paths.map((path, i) => (
               <div
@@ -195,10 +345,7 @@ export default function AssessPage() {
                     <div className="flex items-center gap-3 mb-2">
                       <span
                         className="text-xs font-bold px-2 py-0.5 rounded"
-                        style={{
-                          background: "rgba(124,58,237,0.2)",
-                          color: "#a78bfa",
-                        }}
+                        style={{ background: "rgba(124,58,237,0.2)", color: "#a78bfa" }}
                       >
                         #{i + 1}
                       </span>
@@ -206,31 +353,21 @@ export default function AssessPage() {
                         <span
                           key={tag}
                           className="text-xs px-2 py-0.5 rounded-full"
-                          style={{
-                            background: "rgba(255,255,255,0.06)",
-                            color: "rgba(240,240,255,0.5)",
-                          }}
+                          style={{ background: "rgba(255,255,255,0.06)", color: "rgba(240,240,255,0.5)" }}
                         >
                           {tag}
                         </span>
                       ))}
                     </div>
-                    <h2 className="text-xl font-bold mb-1" style={{ color: "#f0f0ff" }}>
-                      {path.title}
-                    </h2>
+                    <h2 className="text-xl font-bold mb-1" style={{ color: "#f0f0ff" }}>{path.title}</h2>
                     <p style={{ color: "#a78bfa", fontSize: "14px" }}>{path.tagline}</p>
                   </div>
                   <div className="text-right shrink-0">
-                    <div className="text-lg font-bold" style={{ color: "#34d399" }}>
-                      {path.incomeRange}
-                    </div>
-                    <div className="text-xs mt-0.5" style={{ color: "rgba(240,240,255,0.4)" }}>
-                      per month
-                    </div>
+                    <div className="text-lg font-bold" style={{ color: "#34d399" }}>{path.incomeRange}</div>
+                    <div className="text-xs mt-0.5" style={{ color: "rgba(240,240,255,0.4)" }}>per month</div>
                   </div>
                 </div>
 
-                {/* Why it fits */}
                 <div
                   className="rounded-xl p-4 mb-5"
                   style={{ background: "rgba(124,58,237,0.08)", border: "1px solid rgba(124,58,237,0.15)" }}
@@ -241,49 +378,33 @@ export default function AssessPage() {
                   </p>
                 </div>
 
-                {/* Meta row */}
                 <div className="flex flex-wrap gap-5 mb-5">
                   <div>
-                    <div className="text-xs mb-1" style={{ color: "rgba(240,240,255,0.35)" }}>
-                      Time to first income
-                    </div>
-                    <div className="text-sm font-medium" style={{ color: "#f0f0ff" }}>
-                      {path.timeToFirstIncome}
-                    </div>
+                    <div className="text-xs mb-1" style={{ color: "rgba(240,240,255,0.35)" }}>Time to first income</div>
+                    <div className="text-sm font-medium" style={{ color: "#f0f0ff" }}>{path.timeToFirstIncome}</div>
                   </div>
                   <div>
-                    <div className="text-xs mb-1" style={{ color: "rgba(240,240,255,0.35)" }}>
-                      Difficulty
-                    </div>
-                    <div
-                      className="text-sm font-medium"
-                      style={{ color: difficultyColor(path.difficultyLevel) }}
-                    >
+                    <div className="text-xs mb-1" style={{ color: "rgba(240,240,255,0.35)" }}>Difficulty</div>
+                    <div className="text-sm font-medium" style={{ color: difficultyColor(path.difficultyLevel) }}>
                       {path.difficulty}
                     </div>
                   </div>
                 </div>
 
-                {/* First steps */}
                 <div>
                   <div className="text-xs font-semibold mb-3" style={{ color: "rgba(240,240,255,0.4)", letterSpacing: "0.08em" }}>
                     FIRST 3 STEPS
                   </div>
                   <div className="flex flex-col gap-2">
-                    {path.firstSteps.map((step, si) => (
+                    {path.firstSteps.map((s, si) => (
                       <div key={si} className="flex items-start gap-3">
                         <div
                           className="w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold shrink-0 mt-0.5"
-                          style={{
-                            background: "rgba(124,58,237,0.2)",
-                            color: "#a78bfa",
-                          }}
+                          style={{ background: "rgba(124,58,237,0.2)", color: "#a78bfa" }}
                         >
                           {si + 1}
                         </div>
-                        <p className="text-sm leading-relaxed" style={{ color: "rgba(240,240,255,0.65)" }}>
-                          {step}
-                        </p>
+                        <p className="text-sm leading-relaxed" style={{ color: "rgba(240,240,255,0.65)" }}>{s}</p>
                       </div>
                     ))}
                   </div>
@@ -292,20 +413,11 @@ export default function AssessPage() {
             ))}
           </div>
 
-          {/* Restart */}
           <div className="text-center mt-12">
             <button
-              onClick={() => {
-                setResult(null);
-                setStep(0);
-                setForm({ skills: [], interests: [], timeAvailable: "", riskTolerance: "", background: "" });
-              }}
+              onClick={resetAll}
               className="text-sm px-6 py-3 rounded-full"
-              style={{
-                background: "rgba(255,255,255,0.05)",
-                border: "1px solid rgba(255,255,255,0.1)",
-                color: "rgba(240,240,255,0.5)",
-              }}
+              style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(240,240,255,0.5)" }}
             >
               Start over with different inputs
             </button>
@@ -315,33 +427,38 @@ export default function AssessPage() {
     );
   }
 
+  // Assessment form
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "#0a0a0f" }}>
       {/* Top bar */}
       <div className="flex items-center justify-between px-6 py-5 max-w-2xl mx-auto w-full">
-        <Link href="/" className="text-sm" style={{ color: "rgba(240,240,255,0.4)" }}>
-          ← Back
-        </Link>
-        <span className="text-sm font-medium" style={{ color: "rgba(240,240,255,0.4)" }}>
-          Step {step + 1} of {STEPS.length}
-        </span>
+        <Link href="/" className="text-sm" style={{ color: "rgba(240,240,255,0.4)" }}>← Back</Link>
+        <div className="flex items-center gap-4">
+          {status === "authenticated" && (
+            <div className="flex items-center gap-2">
+              {session.user.image && (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={session.user.image} alt="" className="w-6 h-6 rounded-full" />
+              )}
+              <span className="text-xs" style={{ color: "rgba(240,240,255,0.4)" }}>
+                {session.user.email}
+              </span>
+            </div>
+          )}
+          <span className="text-sm font-medium" style={{ color: "rgba(240,240,255,0.4)" }}>
+            Step {step + 1} of {STEPS.length}
+          </span>
+        </div>
       </div>
 
       {/* Progress */}
       <div className="px-6 mb-8 max-w-2xl mx-auto w-full">
         <div className="h-1.5 rounded-full w-full" style={{ background: "rgba(255,255,255,0.08)" }}>
-          <div
-            className="progress-bar h-1.5"
-            style={{ width: `${((step + 1) / STEPS.length) * 100}%` }}
-          />
+          <div className="progress-bar h-1.5" style={{ width: `${((step + 1) / STEPS.length) * 100}%` }} />
         </div>
         <div className="flex justify-between mt-2">
           {STEPS.map((s, i) => (
-            <span
-              key={s}
-              className="text-xs"
-              style={{ color: i <= step ? "#a78bfa" : "rgba(240,240,255,0.2)" }}
-            >
+            <span key={s} className="text-xs" style={{ color: i <= step ? "#a78bfa" : "rgba(240,240,255,0.2)" }}>
               {s}
             </span>
           ))}
@@ -350,12 +467,11 @@ export default function AssessPage() {
 
       {/* Step content */}
       <div className="flex-1 px-6 max-w-2xl mx-auto w-full fade-in-up">
+
         {/* STEP 0 — Skills */}
         {step === 0 && (
           <div>
-            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>
-              What are you good at?
-            </h2>
+            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>What are you good at?</h2>
             <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>
               List skills, tools, knowledge areas — anything you&apos;re genuinely capable at.
             </p>
@@ -373,10 +489,7 @@ export default function AssessPage() {
                 placeholder="e.g. Excel, public speaking, Python... (press Enter to add)"
                 style={{ flex: 1 }}
               />
-              <button
-                onClick={() => addSkill(skillInput)}
-                className="btn-primary text-white px-5 py-3 rounded-xl font-medium text-sm"
-              >
+              <button onClick={() => addSkill(skillInput)} className="btn-primary text-white px-5 py-3 rounded-xl font-medium text-sm">
                 Add
               </button>
             </div>
@@ -390,21 +503,15 @@ export default function AssessPage() {
                 ))}
               </div>
             )}
-            <p className="mt-4 text-xs" style={{ color: "rgba(240,240,255,0.25)" }}>
-              {form.skills.length}/15 skills added
-            </p>
+            <p className="mt-4 text-xs" style={{ color: "rgba(240,240,255,0.25)" }}>{form.skills.length}/15 skills added</p>
           </div>
         )}
 
         {/* STEP 1 — Interests */}
         {step === 1 && (
           <div>
-            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>
-              What genuinely excites you?
-            </h2>
-            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>
-              Pick up to 6 interest areas. Honest answers = better matches.
-            </p>
+            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>What genuinely excites you?</h2>
+            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>Pick up to 6 interest areas.</p>
             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
               {INTEREST_OPTIONS.map((opt) => (
                 <div
@@ -417,21 +524,15 @@ export default function AssessPage() {
                 </div>
               ))}
             </div>
-            <p className="mt-4 text-xs" style={{ color: "rgba(240,240,255,0.25)" }}>
-              {form.interests.length}/6 selected
-            </p>
+            <p className="mt-4 text-xs" style={{ color: "rgba(240,240,255,0.25)" }}>{form.interests.length}/6 selected</p>
           </div>
         )}
 
         {/* STEP 2 — Time */}
         {step === 2 && (
           <div>
-            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>
-              How much time can you commit?
-            </h2>
-            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>
-              Be honest — paths are matched to your real availability.
-            </p>
+            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>How much time can you commit?</h2>
+            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>Be honest — paths are matched to your real availability.</p>
             <div className="flex flex-col gap-3">
               {TIME_OPTIONS.map((opt) => (
                 <div
@@ -439,12 +540,8 @@ export default function AssessPage() {
                   className={`option-card ${form.timeAvailable === opt.value ? "selected" : ""}`}
                   onClick={() => setForm((f) => ({ ...f, timeAvailable: opt.value }))}
                 >
-                  <div className="font-semibold text-sm" style={{ color: form.timeAvailable === opt.value ? "#c4b5fd" : "#f0f0ff" }}>
-                    {opt.label}
-                  </div>
-                  <div className="text-xs mt-0.5" style={{ color: "rgba(240,240,255,0.4)" }}>
-                    {opt.sub}
-                  </div>
+                  <div className="font-semibold text-sm" style={{ color: form.timeAvailable === opt.value ? "#c4b5fd" : "#f0f0ff" }}>{opt.label}</div>
+                  <div className="text-xs mt-0.5" style={{ color: "rgba(240,240,255,0.4)" }}>{opt.sub}</div>
                 </div>
               ))}
             </div>
@@ -454,12 +551,8 @@ export default function AssessPage() {
         {/* STEP 3 — Risk */}
         {step === 3 && (
           <div>
-            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>
-              What&apos;s your risk appetite?
-            </h2>
-            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>
-              This determines whether we suggest stable paths or high-upside bets.
-            </p>
+            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>What&apos;s your risk appetite?</h2>
+            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>This determines stable paths vs. high-upside bets.</p>
             <div className="flex flex-col gap-3">
               {RISK_OPTIONS.map((opt) => (
                 <div
@@ -467,12 +560,8 @@ export default function AssessPage() {
                   className={`option-card ${form.riskTolerance === opt.value ? "selected" : ""}`}
                   onClick={() => setForm((f) => ({ ...f, riskTolerance: opt.value }))}
                 >
-                  <div className="font-semibold text-sm" style={{ color: form.riskTolerance === opt.value ? "#c4b5fd" : "#f0f0ff" }}>
-                    {opt.label}
-                  </div>
-                  <div className="text-xs mt-0.5" style={{ color: "rgba(240,240,255,0.4)" }}>
-                    {opt.sub}
-                  </div>
+                  <div className="font-semibold text-sm" style={{ color: form.riskTolerance === opt.value ? "#c4b5fd" : "#f0f0ff" }}>{opt.label}</div>
+                  <div className="text-xs mt-0.5" style={{ color: "rgba(240,240,255,0.4)" }}>{opt.sub}</div>
                 </div>
               ))}
             </div>
@@ -482,35 +571,48 @@ export default function AssessPage() {
         {/* STEP 4 — Background */}
         {step === 4 && (
           <div>
-            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>
-              Anything else we should know?
-            </h2>
-            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>
-              Optional — but the more context you give, the more tailored your results.
-            </p>
+            <h2 className="text-3xl font-bold mb-2" style={{ color: "#f0f0ff" }}>Anything else we should know?</h2>
+            <p className="mb-8" style={{ color: "rgba(240,240,255,0.45)" }}>Optional — more context = more tailored results.</p>
             <textarea
               rows={5}
               value={form.background}
               onChange={(e) => setForm((f) => ({ ...f, background: e.target.value }))}
-              placeholder="e.g. I'm a nurse with 8 years experience, looking for ways to earn on the side without leaving my job. I'm good with people and have always wanted to teach..."
+              placeholder="e.g. I'm a nurse with 8 years experience, looking for ways to earn on the side..."
             />
-            <p className="mt-3 text-xs" style={{ color: "rgba(240,240,255,0.25)" }}>
-              Your current job, experience, goals, constraints — anything relevant.
-            </p>
-          </div>
-        )}
 
-        {/* Error */}
-        {error && (
-          <div
-            className="mt-4 p-4 rounded-xl text-sm"
-            style={{
-              background: "rgba(248, 113, 113, 0.1)",
-              border: "1px solid rgba(248, 113, 113, 0.2)",
-              color: "#fca5a5",
-            }}
-          >
-            {error}
+            {/* Free / auth notice */}
+            {status === "unauthenticated" && (
+              <div
+                className="mt-5 p-4 rounded-xl text-sm flex items-center gap-3"
+                style={{ background: "rgba(124,58,237,0.08)", border: "1px solid rgba(124,58,237,0.2)" }}
+              >
+                <span>🔐</span>
+                <span style={{ color: "rgba(240,240,255,0.65)" }}>
+                  You&apos;ll sign in with Google — it&apos;s free and takes 5 seconds.
+                </span>
+              </div>
+            )}
+
+            {status === "authenticated" && (
+              <div
+                className="mt-5 p-4 rounded-xl text-sm flex items-center gap-3"
+                style={{ background: "rgba(52,211,153,0.06)", border: "1px solid rgba(52,211,153,0.15)" }}
+              >
+                <span>✓</span>
+                <span style={{ color: "rgba(240,240,255,0.55)" }}>
+                  Signed in as <strong style={{ color: "#f0f0ff" }}>{session.user.email}</strong> · 1 free analysis included
+                </span>
+              </div>
+            )}
+
+            {payError && (
+              <div
+                className="mt-4 p-4 rounded-xl text-sm"
+                style={{ background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.2)", color: "#fca5a5" }}
+              >
+                {payError}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -535,10 +637,7 @@ export default function AssessPage() {
             onClick={() => setStep((s) => s + 1)}
             disabled={!canNext()}
             className="btn-primary text-white font-semibold px-8 py-3 rounded-full"
-            style={{
-              opacity: canNext() ? 1 : 0.35,
-              cursor: canNext() ? "pointer" : "not-allowed",
-            }}
+            style={{ opacity: canNext() ? 1 : 0.35, cursor: canNext() ? "pointer" : "not-allowed" }}
           >
             Continue →
           </button>
@@ -547,7 +646,7 @@ export default function AssessPage() {
             onClick={handleSubmit}
             className="btn-primary text-white font-semibold px-8 py-3 rounded-full"
           >
-            Find my paths →
+            {status === "unauthenticated" ? "Sign in & find my paths →" : "Find my paths →"}
           </button>
         )}
       </div>
