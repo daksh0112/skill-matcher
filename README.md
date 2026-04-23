@@ -1,36 +1,57 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# SkillMatch AI
 
-## Getting Started
+> Discover realistic income paths hidden in your skills — powered by Claude AI.
 
-First, run the development server:
+Enter your skills and interests, answer 4 quick questions, and get 3–5 personalized income paths with income ranges, difficulty ratings, and concrete first steps.
+
+**Live in 60 seconds. No login required.**
+
+---
+
+## Stack
+
+- **Next.js 16** (App Router)
+- **Tailwind CSS v4**
+- **Claude claude-sonnet-4-6** via Anthropic SDK
+- Deploy on **Vercel**
+
+## Local development
 
 ```bash
+# 1. Clone
+git clone https://github.com/daksh0112/skill-matcher.git
+cd skill-matcher
+
+# 2. Install deps
+npm install
+
+# 3. Add API key
+cp .env.local.example .env.local
+# Edit .env.local → set ANTHROPIC_API_KEY
+
+# 4. Run
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+# → http://localhost:3000
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Deploy to Vercel
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+npx vercel
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Then add `ANTHROPIC_API_KEY` in the Vercel dashboard under **Project Settings → Environment Variables**.
 
-## Learn More
+## Project structure
 
-To learn more about Next.js, take a look at the following resources:
+```
+app/
+  page.tsx          # Landing page
+  assess/page.tsx   # Multi-step assessment form + results
+  api/match/        # Claude API route
+globals.css         # Dark theme + custom utilities
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+---
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Built with [Claude Code](https://claude.ai/code)
